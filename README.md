@@ -1,5 +1,7 @@
 # Async Proxy
 
+[![Build and Integration Tests](https://github.com/Inkiiee/async-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Inkiiee/async-proxy/actions/workflows/ci.yml)
+
 [English](#english) | [한국어](#한국어)
 
 ## English
@@ -266,7 +268,6 @@ Use `./build/async_proxy --help` for the complete option list.
 - Add a downstream response write timeout.
 - Cancel acceptors, active sessions, and queued jobs during `stop()`.
 - Make dependency setup work immediately after cloning.
-- Add GitHub Actions for Linux builds and tests.
 - Add overload, timeout, and TLS verification failure integration tests.
 - Publish reproducible latency, RSS, and file-descriptor measurements.
 - Add lightweight runtime metrics.
@@ -608,7 +609,6 @@ bash ./tests/integration_test.sh ./build
 - downstream response write timeout 추가
 - `stop()` 시 acceptor와 활성 session을 취소하고 queue job을 완료 처리
 - clone 직후 빌드할 수 있는 Asio dependency 구성
-- GitHub Actions 기반 Linux build 및 test
 - queue 포화, byte budget 고갈, timeout 및 TLS 검증 실패 통합 테스트
 - 동시 접속 부하에서 latency, RSS 및 file descriptor 측정
 - Prometheus 또는 경량 callback 기반 runtime metrics

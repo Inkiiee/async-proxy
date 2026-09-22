@@ -25,15 +25,43 @@ temp_dir=$(mktemp -d)
 pids=()
 
 cleanup() {
+    status=$?
+    trap - EXIT
+
     for pid in "${pids[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
     for pid in "${pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
+
+    if (( status != 0 )); then
+        for log_file in "$temp_dir"/*.log; do
+            [[ -f "$log_file" ]] || continue
+            echo "--- $(basename "$log_file") ---" >&2
+            cat "$log_file" >&2
+        done
+    fi
+
     rm -rf -- "$temp_dir"
+    exit "$status"
 }
 trap cleanup EXIT
+
+wait_for_response() {
+    local url=$1
+    local output_file=$2
+    shift 2
+
+    for _ in {1..50}; do
+        if curl --fail --silent "$@" "$url" --output "$output_file"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    curl --fail --silent --show-error "$@" "$url" --output "$output_file"
+}
 
 free_port_pair() {
     python3 - <<'PY'
@@ -62,10 +90,9 @@ pids+=("$!")
     >"$temp_dir/plain-proxy.log" 2>&1 &
 pids+=("$!")
 
-sleep 1
-curl --fail --silent --show-error \
+wait_for_response \
     "http://127.0.0.1:$plain_proxy_port/" \
-    --output "$temp_dir/plain-response"
+    "$temp_dir/plain-response"
 test -s "$temp_dir/plain-response"
 
 openssl req -x509 -newkey rsa:2048 -nodes \
@@ -99,10 +126,10 @@ pids+=("$!")
     >"$temp_dir/tls-proxy.log" 2>&1 &
 pids+=("$!")
 
-sleep 1
-curl --fail --insecure --silent --show-error \
+wait_for_response \
     "https://127.0.0.1:$tls_proxy_port/" \
-    --output "$temp_dir/tls-response"
+    "$temp_dir/tls-response" \
+    --insecure
 test -s "$temp_dir/tls-response"
 
 echo "plain HTTP and TLS relay integration tests passed"

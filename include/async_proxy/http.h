@@ -56,7 +56,8 @@ namespace async_proxy {
     HttpResponseInspection inspect_http_response(
         std::string_view input,
         std::size_t max_message_size,
-        std::size_t max_header_size = 64 * 1024
+        std::size_t max_header_size = 64 * 1024,
+        std::string_view request_method = {}
     );
 
     std::string serialize_http_request(
@@ -67,7 +68,8 @@ namespace async_proxy {
     std::string make_error_response(
         int status,
         std::string_view reason,
-        std::string_view message
+        std::string_view message,
+        bool include_body = true
     );
 }
 

@@ -433,7 +433,8 @@ HttpRequestParseResult parse_http_request(
 HttpResponseInspection inspect_http_response(
     string_view input,
     size_t max_message_size,
-    size_t max_header_size
+    size_t max_header_size,
+    string_view request_method
 ) {
     if (input.size() > max_message_size)
         return response_result(HttpResponseStatus::TooLarge, 0, "HTTP response is too large");
@@ -487,16 +488,17 @@ HttpResponseInspection inspect_http_response(
             return response_result(HttpResponseStatus::Invalid, 0, "protocol upgrades are not supported");
 
         const bool informational = status_code >= 100 && status_code < 200;
-        const bool body_forbidden = informational || status_code == 204 || status_code == 304;
-        if (body_forbidden) {
+        if (informational || status_code == 204) {
             if (head.chunked || (head.content_length && *head.content_length != 0))
                 return response_result(HttpResponseStatus::Invalid, 0, "response status cannot contain a body");
-            if (informational) {
-                if (input.size() == body_begin)
-                    return response_result(HttpResponseStatus::Incomplete);
-                response_begin = body_begin;
-                continue;
-            }
+        }
+        if (informational) {
+            if (input.size() == body_begin)
+                return response_result(HttpResponseStatus::Incomplete);
+            response_begin = body_begin;
+            continue;
+        }
+        if (request_method == "HEAD" || status_code == 204 || status_code == 304) {
             if (input.size() != body_begin)
                 return response_result(HttpResponseStatus::Invalid, 0, "unexpected data after bodyless response");
             return response_result(HttpResponseStatus::Complete, body_begin);
@@ -561,14 +563,15 @@ string serialize_http_request(const HttpRequest& request, string_view upstream_a
     return output.str();
 }
 
-string make_error_response(int status, string_view reason, string_view message) {
+string make_error_response(int status, string_view reason, string_view message, bool include_body) {
     const string body = "{\"error\":\"" + json_escape(message) + "\"}";
     ostringstream output;
     output << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
            << "Content-Type: application/json; charset=utf-8\r\n"
            << "Content-Length: " << body.size() << "\r\n"
-           << "Connection: close\r\n\r\n"
-           << body;
+           << "Connection: close\r\n\r\n";
+    if (include_body)
+        output << body;
     return output.str();
 }
 }

@@ -35,7 +35,7 @@ This repository does not publish code from a specific product or business domain
 | Resource limits | Session cap, request queue capacity, global in-flight byte budget |
 | HTTP framing | Content-Length, chunked, and close-delimited responses |
 | Validation | Duplicate length, CL+TE, invalid line endings, and incomplete EOF rejection |
-| Timeouts | TLS handshake, request read, upstream operation, and response wait |
+| Timeouts | TLS handshake, request read, upstream operation, response wait, and response write |
 | TLS memory | Reused SSL contexts and a bounded downstream session cache |
 | Extension points | Request preflight, request/response transforms, and logging callback |
 | Tests | HTTP parser unit test and plain HTTP/TLS integration test |
@@ -73,7 +73,10 @@ Each accepted connection acquires a session slot. As request and response data i
 | `handshake_timeout` | 5 s | Downstream TLS handshake deadline |
 | `request_timeout` | 10 s | Downstream request read deadline |
 | `upstream_timeout` | 10 s | Resolve-to-response upstream deadline |
-| `response_timeout` | 15 s | Wait for a queued job's response |
+| `response_timeout` | 15 s | Deadline from queue submission through upstream completion |
+| `response_write_timeout` | 10 s | Downstream response write deadline |
+
+Workers skip expired queued requests and cap upstream I/O at the remaining job deadline. `stop()` cancels pending accepts, sessions, and workers, then joins the I/O threads.
 
 The defaults are demonstration values. Tune them for the target device and workload.
 
@@ -204,7 +207,7 @@ Run the loopback HTTP and TLS integration test:
 bash ./tests/integration_test.sh ./build
 ```
 
-The integration script generates temporary servers and certificates, validates HTTP-to-HTTP and HTTPS-to-HTTPS relay paths, and removes its generated files on exit.
+The integration script checks the response bodies on the HTTP-to-HTTP and HTTPS-to-HTTPS relay paths. It verifies certificates on both TLS connections using a temporary CA and removes its generated files on exit.
 
 ### Run
 
@@ -257,16 +260,12 @@ Use `./build/async_proxy --help` for the complete option list.
 - No HTTP pipelining or downstream keep-alive.
 - No upstream connection pooling; every request creates a new connection.
 - Normal request and response messages are limited to 4 MiB; body streaming is not implemented.
-- A response timeout stops the downstream wait but does not yet cancel a queued job.
-- Downstream response writes do not yet have a separate timeout.
+- An upstream can still process a request that was sent before the response deadline.
 - Restarting the same `ProxySystem` instance after `stop()` is outside the supported lifecycle.
 - Custom hook output is not independently checked against a final size limit.
 
 ### Roadmap
 
-- Propagate job deadlines and cancellation state to workers.
-- Add a downstream response write timeout.
-- Cancel acceptors, active sessions, and queued jobs during `stop()`.
 - Make dependency setup work immediately after cloning.
 - Add overload, timeout, and TLS verification failure integration tests.
 - Publish reproducible latency, RSS, and file-descriptor measurements.
@@ -360,7 +359,10 @@ flowchart LR
 | `handshake_timeout` | 5초 | downstream TLS handshake 제한 |
 | `request_timeout` | 10초 | downstream request 수신 제한 |
 | `upstream_timeout` | 10초 | resolve부터 response 수신까지의 제한 |
-| `response_timeout` | 15초 | queue 제출 후 downstream 응답 대기 제한 |
+| `response_timeout` | 15초 | queue 제출부터 upstream 응답 완료까지의 제한 |
+| `response_write_timeout` | 10초 | downstream 응답 전송 제한 |
+
+워커는 만료된 대기 작업을 건너뛰고 남은 시간 안에서 upstream I/O를 수행한다. `stop()`은 대기 중인 accept와 활성 세션, 워커를 취소한 뒤 I/O 스레드를 종료한다.
 
 ### 과부하 동작
 
@@ -520,7 +522,7 @@ bash ./tests/integration_test.sh ./build
 - HTTP client → HTTP listener → HTTP upstream
 - HTTPS client → HTTPS listener → HTTPS upstream
 
-생성한 인증서, 로그 및 임시 파일은 테스트 종료 시 삭제한다.
+두 경로에서 받은 응답 본문을 예상한 내용과 비교한다. TLS 연결 양쪽의 인증서는 임시 CA로 검증한다. 생성한 인증서, 로그 및 임시 파일은 테스트 종료 시 삭제한다.
 
 ## 실행
 
@@ -598,16 +600,12 @@ bash ./tests/integration_test.sh ./build
 - HTTP pipelining과 downstream keep-alive를 지원하지 않는다.
 - upstream connection pooling을 사용하지 않고 요청마다 새 연결을 만든다.
 - 일반 request/response는 최대 4 MiB이며 대용량 body streaming은 지원하지 않는다.
-- response timeout은 downstream 대기를 종료하지만 이미 queue에 들어간 job을 취소하지 않는다.
-- downstream response write에는 별도의 timeout이 아직 적용되지 않았다.
+- 응답 기한 전에 전송된 요청은 기한이 지난 뒤에도 upstream에서 처리될 수 있다.
 - 하나의 `ProxySystem` 객체에서 `stop()` 후 다시 `start()`하는 동작은 지원 범위가 아니다.
 - 사용자 정의 hook이 생성한 데이터의 최종 크기 제한은 hook 작성자가 지켜야 한다.
 
 ## 향후 개선
 
-- job deadline과 취소 상태를 worker까지 전파
-- downstream response write timeout 추가
-- `stop()` 시 acceptor와 활성 session을 취소하고 queue job을 완료 처리
 - clone 직후 빌드할 수 있는 Asio dependency 구성
 - queue 포화, byte budget 고갈, timeout 및 TLS 검증 실패 통합 테스트
 - 동시 접속 부하에서 latency, RSS 및 file descriptor 측정

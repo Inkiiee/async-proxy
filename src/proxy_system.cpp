@@ -14,6 +14,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,38 @@ namespace async_proxy {
 namespace {
     using tcp = asio::ip::tcp;
     using TlsStream = asio::ssl::stream<tcp::socket>;
+    using Clock = chrono::steady_clock;
+
+    class Deadline {
+    public:
+        template <typename OnTimeout>
+        Deadline(asio::any_io_executor executor, Clock::time_point expiry, OnTimeout on_timeout)
+            : timer_(executor, expiry), armed_(make_shared<bool>(true)) {
+            timer_.async_wait([armed = armed_, on_timeout = move(on_timeout)](const asio::error_code& ec) {
+                if (!ec && *armed)
+                    on_timeout();
+            });
+        }
+
+        ~Deadline() {
+            // A ready timer handler can still run after the operation returns.
+            // The operation and the timer handler run on the same strand.
+            *armed_ = false;
+        }
+
+        bool expired() const {
+            return Clock::now() >= timer_.expiry();
+        }
+
+    private:
+        asio::steady_timer timer_;
+        shared_ptr<bool> armed_;
+    };
+
+    void close_socket(tcp::socket& socket) {
+        asio::error_code ignored;
+        socket.close(ignored);
+    }
 
     struct ByteLease {
         ByteLease(atomic<size_t>& used, size_t limit)
@@ -137,7 +171,8 @@ namespace {
     asio::awaitable<UpstreamResult> read_response(
         Stream& stream,
         const ProxyConfig& config,
-        const shared_ptr<ByteLease>& lease
+        const shared_ptr<ByteLease>& lease,
+        string_view request_method
     ) {
         array<char, 16 * 1024> buffer{};
         string input;
@@ -165,7 +200,8 @@ namespace {
                 const auto framing = inspect_http_response(
                     input,
                     config.max_response_size,
-                    config.max_header_size
+                    config.max_header_size,
+                    request_method
                 );
                 if (framing.status == HttpResponseStatus::Complete)
                     co_return UpstreamResult{{}, move(input), {}, false};
@@ -182,16 +218,16 @@ namespace {
             }
 
             if (ec) {
-                const bool eof = ec == asio::error::eof ||
-                    ec == asio::ssl::error::stream_truncated;
-                if (eof && !input.empty()) {
+                if ((ec == asio::error::eof || ec == asio::ssl::error::stream_truncated) &&
+                    !input.empty()) {
                     const auto framing = inspect_http_response(
                         input,
                         config.max_response_size,
-                        config.max_header_size
+                        config.max_header_size,
+                        request_method
                     );
                     if (framing.status == HttpResponseStatus::Complete ||
-                        framing.status == HttpResponseStatus::CloseDelimited) {
+                        (ec == asio::error::eof && framing.status == HttpResponseStatus::CloseDelimited)) {
                         co_return UpstreamResult{{}, move(input), {}, false};
                     }
                     co_return UpstreamResult{
@@ -246,11 +282,13 @@ public:
     }
 
     void start() {
-        bool expected = false;
-        if (!running_.compare_exchange_strong(expected, true))
+        unique_lock lock(lifecycle_mutex_);
+        if (running_.load())
             return;
 
         try {
+            auto http_acceptor = make_acceptor(config_.http_port);
+            auto https_acceptor = make_acceptor(config_.https_port);
             io_.restart();
             work_guard_.emplace(asio::make_work_guard(io_));
             request_queue_ = make_unique<RequestQueue>(
@@ -258,18 +296,7 @@ public:
                 max<size_t>(1, config_.queue_capacity)
             );
 
-            if (config_.http_port != 0) {
-                http_acceptor_ = make_acceptor(config_.http_port);
-                spawn(accept_loop(http_acceptor_, false), "HTTP accept loop");
-            }
-            if (config_.https_port != 0) {
-                https_acceptor_ = make_acceptor(config_.https_port);
-                spawn(accept_loop(https_acceptor_, true), "HTTPS accept loop");
-            }
-
-            for (size_t i = 0; i < config_.worker_count; ++i)
-                spawn(worker_loop(), "proxy worker");
-
+            running_.store(true);
             threads_.reserve(config_.io_thread_count);
             for (size_t i = 0; i < config_.io_thread_count; ++i) {
                 threads_.emplace_back([this] {
@@ -283,40 +310,25 @@ public:
                 });
             }
 
-            log(LogLevel::Info, "async proxy started");
+            start_listener(move(http_acceptor), false);
+            start_listener(move(https_acceptor), true);
+            for (size_t i = 0; i < config_.worker_count; ++i)
+                spawn(asio::make_strand(io_), worker_loop(), "proxy worker");
         } catch (...) {
-            running_.store(false);
-            if (request_queue_)
-                request_queue_->close();
-            work_guard_.reset();
-            io_.stop();
-            for (auto& thread : threads_) {
-                if (thread.joinable())
-                    thread.join();
-            }
-            threads_.clear();
-            request_queue_.reset();
+            shutdown();
             throw;
         }
+        lock.unlock();
+        log(LogLevel::Info, "async proxy started");
     }
 
     void stop() {
-        if (!running_.exchange(false))
+        unique_lock lock(lifecycle_mutex_);
+        if (!running_.load())
             return;
 
-        if (request_queue_)
-            request_queue_->close();
-        work_guard_.reset();
-        io_.stop();
-
-        for (auto& thread : threads_) {
-            if (thread.joinable())
-                thread.join();
-        }
-        threads_.clear();
-        http_acceptor_.reset();
-        https_acceptor_.reset();
-        request_queue_.reset();
+        shutdown();
+        lock.unlock();
         log(LogLevel::Info, "async proxy stopped");
     }
 
@@ -332,6 +344,9 @@ private:
         ProxyRequest request;
         shared_ptr<ResponseChannel> response_channel;
         shared_ptr<ByteLease> byte_lease;
+        Clock::time_point deadline;
+
+        bool expired() const { return Clock::now() >= deadline; }
     };
 
     using JobPtr = shared_ptr<Job>;
@@ -340,9 +355,13 @@ private:
     using WorkGuard = asio::executor_work_guard<asio::io_context::executor_type>;
 
     struct SessionLease {
-        explicit SessionLease(atomic<size_t>& count) : count_(count) {}
-        ~SessionLease() { count_.fetch_sub(1); }
-        atomic<size_t>& count_;
+        explicit SessionLease(atomic<size_t>& count) : count_(&count) {}
+        SessionLease(SessionLease&& other) noexcept : count_(exchange(other.count_, nullptr)) {}
+        ~SessionLease() {
+            if (count_)
+                count_->fetch_sub(1);
+        }
+        atomic<size_t>* count_;
     };
 
     ProxyConfig config_;
@@ -350,16 +369,38 @@ private:
     asio::io_context io_;
     optional<WorkGuard> work_guard_;
     unique_ptr<RequestQueue> request_queue_;
-    shared_ptr<tcp::acceptor> http_acceptor_;
-    shared_ptr<tcp::acceptor> https_acceptor_;
     asio::ssl::context upstream_tls_context_;
     asio::ssl::context downstream_tls_context_;
     vector<thread> threads_;
+    mutex lifecycle_mutex_;
+    mutex tasks_mutex_;
+    unordered_map<shared_ptr<asio::cancellation_signal>, asio::any_io_executor> tasks_;
     atomic<bool> running_{false};
     atomic<size_t> active_sessions_{0};
     atomic<size_t> inflight_bytes_{0};
     atomic<uint64_t> next_request_id_{1};
     mutex log_mutex_;
+
+    void shutdown() {
+        running_.store(false);
+        if (request_queue_)
+            request_queue_->close();
+
+        decltype(tasks_) tasks;
+        {
+            lock_guard lock(tasks_mutex_);
+            tasks.swap(tasks_);
+        }
+        for (const auto& [signal, executor] : tasks) {
+            asio::post(executor, [signal] { signal->emit(asio::cancellation_type::terminal); });
+        }
+
+        work_guard_.reset();
+        for (auto& thread : threads_)
+            thread.join();
+        threads_.clear();
+        request_queue_.reset();
+    }
 
     void validate_config() const {
         if (config_.http_port == 0 && config_.https_port == 0)
@@ -428,43 +469,70 @@ private:
         SSL_CTX_set_mode(downstream_tls_context_.native_handle(), SSL_MODE_RELEASE_BUFFERS);
     }
 
-    shared_ptr<tcp::acceptor> make_acceptor(uint16_t port) {
+    optional<tcp::acceptor> make_acceptor(uint16_t port) {
+        if (port == 0)
+            return nullopt;
+
         asio::error_code ec;
         const auto address = asio::ip::make_address(config_.listen_address, ec);
         if (ec)
             throw invalid_argument("invalid listen address: " + ec.message());
 
-        auto acceptor = make_shared<tcp::acceptor>(io_);
+        tcp::acceptor acceptor(asio::make_strand(io_));
         const tcp::endpoint endpoint(address, port);
-        acceptor->open(endpoint.protocol(), ec);
+        acceptor.open(endpoint.protocol(), ec);
         if (!ec)
-            acceptor->set_option(tcp::acceptor::reuse_address(true), ec);
+            acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
         if (!ec)
-            acceptor->bind(endpoint, ec);
+            acceptor.bind(endpoint, ec);
         if (!ec)
-            acceptor->listen(asio::socket_base::max_listen_connections, ec);
+            acceptor.listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
             throw runtime_error("failed to open listener on port " + to_string(port) + ": " + ec.message());
         return acceptor;
     }
 
-    template <typename Awaitable>
-    void spawn(Awaitable awaitable, string operation) {
-        asio::co_spawn(
-            io_,
-            move(awaitable),
-            [this, operation = move(operation)](exception_ptr error) {
+    void start_listener(optional<tcp::acceptor> acceptor, bool tls) {
+        if (!acceptor)
+            return;
+        const auto executor = acceptor->get_executor();
+        spawn(executor, accept_loop(move(*acceptor), tls), tls ? "HTTPS accept loop" : "HTTP accept loop");
+    }
+
+    void spawn(asio::any_io_executor executor, asio::awaitable<void> work, string operation) {
+        asio::post(executor, [this, executor, work = move(work), operation = move(operation)]() mutable {
+            auto signal = make_shared<asio::cancellation_signal>();
+            {
+                lock_guard lock(tasks_mutex_);
+                if (!running_.load())
+                    return;
+                tasks_.emplace(signal, executor);
+            }
+
+            auto complete = [this, signal, operation = move(operation)](exception_ptr error) {
+                {
+                    lock_guard lock(tasks_mutex_);
+                    tasks_.erase(signal);
+                }
                 if (!error)
                     return;
                 try {
                     rethrow_exception(error);
+                } catch (const asio::system_error& ex) {
+                    if (running_.load() || ex.code() != asio::error::operation_aborted)
+                        log(LogLevel::Error, operation + " failed: " + ex.what());
                 } catch (const exception& ex) {
                     log(LogLevel::Error, operation + " failed: " + ex.what());
                 } catch (...) {
                     log(LogLevel::Error, operation + " failed with an unknown exception");
                 }
+            };
+            try {
+                asio::co_spawn(executor, move(work), asio::bind_cancellation_slot(signal->slot(), complete));
+            } catch (...) {
+                complete(current_exception());
             }
-        );
+        });
     }
 
     void log(LogLevel level, string_view message) {
@@ -485,9 +553,11 @@ private:
         return false;
     }
 
-    asio::awaitable<void> accept_loop(shared_ptr<tcp::acceptor> acceptor, bool tls) {
+    asio::awaitable<void> accept_loop(tcp::acceptor acceptor, bool tls) {
         while (running_.load()) {
-            auto [ec, socket] = co_await acceptor->async_accept(
+            asio::any_io_executor executor = asio::make_strand(io_);
+            auto [ec, socket] = co_await acceptor.async_accept(
+                executor,
                 asio::as_tuple(asio::use_awaitable)
             );
             if (ec) {
@@ -496,7 +566,7 @@ private:
                     co_return;
                 }
                 log(LogLevel::Warning, "accept failed; retrying: " + ec.message());
-                asio::steady_timer timer(io_, config_.accept_retry_delay);
+                asio::steady_timer timer(acceptor.get_executor(), config_.accept_retry_delay);
                 auto [timer_ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
                 if (timer_ec)
                     co_return;
@@ -505,18 +575,11 @@ private:
 
             if (!try_acquire_session()) {
                 log(LogLevel::Warning, "session limit reached; rejecting connection");
-                asio::error_code ignored;
-                socket.close(ignored);
                 continue;
             }
 
-            if (tls) {
-                auto stream = make_shared<TlsStream>(move(socket), downstream_tls_context_);
-                spawn(tls_session(move(stream)), "HTTPS session");
-            } else {
-                auto stream = make_shared<tcp::socket>(move(socket));
-                spawn(plain_session(move(stream)), "HTTP session");
-            }
+            spawn(executor, session(move(socket), SessionLease(active_sessions_), tls),
+                  tls ? "HTTPS session" : "HTTP session");
         }
     }
 
@@ -539,64 +602,52 @@ private:
         shared_ptr<ByteLease> byte_lease,
         asio::any_io_executor executor
     ) {
+        const bool include_body = request.http.method != "HEAD";
+        const auto expires_at = Clock::now() + config_.response_timeout;
         auto response_channel = make_shared<ResponseChannel>(executor, 1);
         auto job = make_shared<Job>();
         job->request = move(request);
         job->response_channel = response_channel;
         job->byte_lease = move(byte_lease);
+        job->deadline = expires_at;
 
-        if (!request_queue_ ||
-            !request_queue_->try_send(asio::error_code{}, move(job))) {
+        if (!request_queue_->try_send(asio::error_code{}, move(job))) {
             co_return ProxyResponse{
-                make_error_response(503, "Service Unavailable", "proxy request queue is full")
+                make_error_response(503, "Service Unavailable", "proxy request queue is full", include_body)
             };
         }
 
-        auto timeout = make_shared<asio::steady_timer>(executor, config_.response_timeout);
-        asio::co_spawn(
-            executor,
-            [timeout, response_channel]() -> asio::awaitable<void> {
-                auto [ec] = co_await timeout->async_wait(asio::as_tuple(asio::use_awaitable));
-                if (!ec)
-                    response_channel->try_send(asio::error::timed_out, ProxyResponse{});
-            },
-            asio::detached
-        );
+        Deadline deadline(executor, expires_at, [response_channel] {
+            response_channel->try_send(asio::error::timed_out, ProxyResponse{});
+        });
 
         auto [ec, response] = co_await response_channel->async_receive(
             asio::as_tuple(asio::use_awaitable)
         );
-        timeout->cancel();
         response_channel->close();
-        if (ec) {
+        if (ec || deadline.expired()) {
             co_return ProxyResponse{
-                make_error_response(504, "Gateway Timeout", "proxy response timed out")
+                make_error_response(504, "Gateway Timeout", "proxy response timed out", include_body)
             };
         }
         co_return response;
     }
 
-    asio::awaitable<void> plain_session(shared_ptr<tcp::socket> socket) {
-        SessionLease session_lease(active_sessions_);
+    template <typename Stream>
+    asio::awaitable<bool> serve_session(Stream& stream, tcp::socket& socket, bool tls) {
         auto byte_lease = make_shared<ByteLease>(inflight_bytes_, config_.max_inflight_bytes);
-
+        const auto executor = stream.get_executor();
         asio::error_code endpoint_ec;
-        const tcp::endpoint endpoint = socket->remote_endpoint(endpoint_ec);
-        auto timed_out = make_shared<atomic<bool>>(false);
-        auto timeout = make_shared<asio::steady_timer>(io_, config_.request_timeout);
-        timeout->async_wait([socket, timed_out](const asio::error_code& ec) {
-            if (ec)
-                return;
-            timed_out->store(true);
-            asio::error_code ignored;
-            socket->cancel(ignored);
-            socket->close(ignored);
-        });
-
-        auto read = co_await read_request(*socket, config_, byte_lease);
-        timeout->cancel();
-        if (timed_out->load())
-            co_return;
+        const tcp::endpoint endpoint = socket.remote_endpoint(endpoint_ec);
+        ReadRequestResult read;
+        {
+            Deadline deadline(executor, Clock::now() + config_.request_timeout, [&socket] {
+                close_socket(socket);
+            });
+            read = co_await read_request(stream, config_, byte_lease);
+            if (deadline.expired() || !running_.load())
+                co_return false;
+        }
 
         ProxyResponse response;
         if (read.error) {
@@ -609,125 +660,81 @@ private:
             );
         } else {
             response = co_await enqueue_and_wait(
-                make_proxy_request(move(read.request), endpoint, false),
+                make_proxy_request(move(read.request), endpoint, tls),
                 byte_lease,
-                socket->get_executor()
+                executor
             );
         }
 
-        if (!response.raw_http.empty()) {
-            auto [write_ec, bytes] = co_await asio::async_write(
-                *socket,
-                asio::buffer(response.raw_http),
-                asio::as_tuple(asio::use_awaitable)
-            );
-            (void)bytes;
-            if (write_ec)
-                log(LogLevel::Warning, "client response write failed: " + write_ec.message());
-        }
+        if (!running_.load())
+            co_return false;
+        if (response.raw_http.empty())
+            co_return true;
 
-        asio::error_code ignored;
-        socket->shutdown(tcp::socket::shutdown_both, ignored);
-        socket->close(ignored);
-    }
-
-    asio::awaitable<void> tls_session(shared_ptr<TlsStream> stream) {
-        SessionLease session_lease(active_sessions_);
-        auto byte_lease = make_shared<ByteLease>(inflight_bytes_, config_.max_inflight_bytes);
-
-        asio::error_code endpoint_ec;
-        const tcp::endpoint endpoint = stream->next_layer().remote_endpoint(endpoint_ec);
-        auto handshake_timed_out = make_shared<atomic<bool>>(false);
-        auto handshake_timeout = make_shared<asio::steady_timer>(io_, config_.handshake_timeout);
-        handshake_timeout->async_wait([stream, handshake_timed_out](const asio::error_code& ec) {
-            if (ec)
-                return;
-            handshake_timed_out->store(true);
-            asio::error_code ignored;
-            stream->next_layer().cancel(ignored);
-            stream->next_layer().close(ignored);
+        Deadline deadline(executor, Clock::now() + config_.response_write_timeout, [&socket] {
+            close_socket(socket);
         });
-
-        auto [handshake_ec] = co_await stream->async_handshake(
-            asio::ssl::stream_base::server,
+        auto [write_ec, bytes] = co_await asio::async_write(
+            stream,
+            asio::buffer(response.raw_http),
             asio::as_tuple(asio::use_awaitable)
         );
-        handshake_timeout->cancel();
-        if (handshake_ec || handshake_timed_out->load()) {
-            if (!handshake_timed_out->load())
-                log(LogLevel::Warning, "TLS handshake failed: " + handshake_ec.message());
+        (void)bytes;
+        if (!running_.load())
+            co_return false;
+        if (deadline.expired()) {
+            log(LogLevel::Warning, "client response write timed out");
+            co_return false;
+        }
+        if (write_ec)
+            log(LogLevel::Warning, "client response write failed: " + write_ec.message());
+        co_return !write_ec;
+    }
+
+    asio::awaitable<void> session(tcp::socket socket, [[maybe_unused]] SessionLease lease, bool tls) {
+        if (!tls) {
+            if (co_await serve_session(socket, socket, false)) {
+                asio::error_code ignored;
+                socket.shutdown(tcp::socket::shutdown_both, ignored);
+            }
             co_return;
         }
 
-        auto read_timed_out = make_shared<atomic<bool>>(false);
-        auto read_timeout = make_shared<asio::steady_timer>(io_, config_.request_timeout);
-        read_timeout->async_wait([stream, read_timed_out](const asio::error_code& ec) {
-            if (ec)
-                return;
-            read_timed_out->store(true);
-            asio::error_code ignored;
-            stream->next_layer().cancel(ignored);
-            stream->next_layer().close(ignored);
-        });
-
-        auto read = co_await read_request(*stream, config_, byte_lease);
-        read_timeout->cancel();
-        if (read_timed_out->load())
-            co_return;
-
-        ProxyResponse response;
-        if (read.error) {
-            const int status = read.too_large ? 413 : (read.resource_exhausted ? 503 : 400);
-            response.raw_http = make_error_response(
-                status,
-                status == 413 ? "Payload Too Large" :
-                    (status == 503 ? "Service Unavailable" : "Bad Request"),
-                read.error_message
-            );
-        } else {
-            response = co_await enqueue_and_wait(
-                make_proxy_request(move(read.request), endpoint, true),
-                byte_lease,
-                stream->get_executor()
-            );
-        }
-
-        if (!response.raw_http.empty()) {
-            auto [write_ec, bytes] = co_await asio::async_write(
-                *stream,
-                asio::buffer(response.raw_http),
+        TlsStream stream(move(socket), downstream_tls_context_);
+        const auto executor = stream.get_executor();
+        auto& transport = stream.next_layer();
+        auto close = [&transport] { close_socket(transport); };
+        {
+            Deadline deadline(executor, Clock::now() + config_.handshake_timeout, close);
+            auto [ec] = co_await stream.async_handshake(
+                asio::ssl::stream_base::server,
                 asio::as_tuple(asio::use_awaitable)
             );
-            (void)bytes;
-            if (write_ec)
-                log(LogLevel::Warning, "TLS client response write failed: " + write_ec.message());
+            if (deadline.expired() || !running_.load())
+                co_return;
+            if (ec) {
+                log(LogLevel::Warning, "TLS handshake failed: " + ec.message());
+                co_return;
+            }
         }
 
-        auto shutdown_timeout = make_shared<asio::steady_timer>(io_, config_.tls_shutdown_timeout);
-        shutdown_timeout->async_wait([stream](const asio::error_code& ec) {
-            if (ec)
-                return;
-            asio::error_code ignored;
-            stream->next_layer().cancel(ignored);
-            stream->next_layer().close(ignored);
-        });
-        auto [shutdown_ec] = co_await stream->async_shutdown(asio::as_tuple(asio::use_awaitable));
-        (void)shutdown_ec;
-        shutdown_timeout->cancel();
-        asio::error_code ignored;
-        stream->next_layer().close(ignored);
+        if (co_await serve_session(stream, transport, true)) {
+            Deadline deadline(executor, Clock::now() + config_.tls_shutdown_timeout, close);
+            co_await stream.async_shutdown(asio::as_tuple(asio::use_awaitable));
+        }
     }
 
     asio::awaitable<void> worker_loop() {
         while (running_.load()) {
-            if (!request_queue_)
-                co_return;
             auto [ec, job] = co_await request_queue_->async_receive(
                 asio::as_tuple(asio::use_awaitable)
             );
-            if (ec || !job)
+            if (ec || !job || !running_.load())
                 co_return;
+            if (job->expired())
+                continue;
 
+            const bool include_body = job->request.http.method != "HEAD";
             ProxyResponse response;
             try {
                 if (handlers_.request_preflight) {
@@ -735,18 +742,25 @@ private:
                     if (immediate)
                         response = move(*immediate);
                 }
+                if (job->expired() || !running_.load())
+                    continue;
 
                 if (response.raw_http.empty()) {
                     if (handlers_.request_transform)
                         handlers_.request_transform(job->request);
 
-                    auto upstream = co_await send_upstream(job->request, job->byte_lease);
+                    if (job->expired() || !running_.load())
+                        continue;
+                    auto upstream = co_await send_upstream(*job);
+                    if (job->expired() || !running_.load())
+                        continue;
                     if (upstream.error) {
                         const int status = upstream.timed_out ? 504 : 502;
                         response.raw_http = make_error_response(
                             status,
                             upstream.timed_out ? "Gateway Timeout" : "Bad Gateway",
-                            upstream.error_message.empty() ? "upstream request failed" : upstream.error_message
+                            upstream.error_message.empty() ? "upstream request failed" : upstream.error_message,
+                            include_body
                         );
                         log(LogLevel::Warning, "upstream request failed: " + upstream.error_message);
                     } else {
@@ -754,13 +768,17 @@ private:
                     }
                 }
 
-                if (handlers_.response_transform)
+                if (handlers_.response_transform && !job->expired() && running_.load())
                     handlers_.response_transform(job->request, response);
             } catch (const exception& error) {
-                response.raw_http = make_error_response(500, "Internal Server Error", "proxy handler failed");
+                if (!running_.load())
+                    co_return;
+                response.raw_http = make_error_response(500, "Internal Server Error", "proxy handler failed", include_body);
                 log(LogLevel::Error, string("proxy handler failed: ") + error.what());
             } catch (...) {
-                response.raw_http = make_error_response(500, "Internal Server Error", "proxy handler failed");
+                if (!running_.load())
+                    co_return;
+                response.raw_http = make_error_response(500, "Internal Server Error", "proxy handler failed", include_body);
                 log(LogLevel::Error, "proxy handler failed with an unknown exception");
             }
 
@@ -768,162 +786,102 @@ private:
         }
     }
 
-    asio::awaitable<UpstreamResult> send_upstream(
-        const ProxyRequest& request,
-        const shared_ptr<ByteLease>& byte_lease
-    ) {
+    asio::awaitable<UpstreamResult> send_upstream(const Job& job) {
+        const auto expires_at = min(job.deadline, Clock::now() + config_.upstream_timeout);
         string raw_request;
         try {
-            raw_request = serialize_http_request(request.http, upstream_authority(config_));
+            raw_request = serialize_http_request(job.request.http, upstream_authority(config_));
         } catch (const exception& error) {
             co_return UpstreamResult{
                 asio::error::invalid_argument, {}, error.what(), false
             };
         }
 
-        if (!byte_lease->grow(raw_request.size())) {
+        if (!job.byte_lease->grow(raw_request.size())) {
             co_return UpstreamResult{
                 asio::error::no_buffer_space, {}, "proxy in-flight byte budget is exhausted", false
             };
         }
 
-        if (config_.upstream_tls)
-            co_return co_await send_upstream_tls(move(raw_request), byte_lease);
-        co_return co_await send_upstream_plain(move(raw_request), byte_lease);
+        const auto executor = co_await asio::this_coro::executor;
+        if (config_.upstream_tls) {
+            TlsStream stream(executor, upstream_tls_context_);
+            co_return co_await exchange_upstream(stream, stream.next_layer(), raw_request, job, expires_at);
+        }
+        tcp::socket socket(executor);
+        co_return co_await exchange_upstream(socket, socket, raw_request, job, expires_at);
     }
 
-    asio::awaitable<UpstreamResult> send_upstream_plain(
-        string request,
-        shared_ptr<ByteLease> byte_lease
+    template <typename Stream>
+    asio::awaitable<UpstreamResult> exchange_upstream(
+        Stream& stream,
+        tcp::socket& socket,
+        const string& request,
+        const Job& job,
+        Clock::time_point expires_at
     ) {
-        auto resolver = make_shared<tcp::resolver>(io_);
-        auto socket = make_shared<tcp::socket>(io_);
-        auto timed_out = make_shared<atomic<bool>>(false);
-        auto timeout = make_shared<asio::steady_timer>(io_, config_.upstream_timeout);
-        timeout->async_wait([resolver, socket, timed_out](const asio::error_code& ec) {
-            if (ec)
-                return;
-            timed_out->store(true);
-            resolver->cancel();
-            asio::error_code ignored;
-            socket->cancel(ignored);
-            socket->close(ignored);
-        });
-
-        auto [resolve_ec, endpoints] = co_await resolver->async_resolve(
-            config_.upstream_host,
-            config_.upstream_port,
-            asio::as_tuple(asio::use_awaitable)
-        );
-        if (resolve_ec) {
-            timeout->cancel();
-            co_return UpstreamResult{resolve_ec, {}, resolve_ec.message(), timed_out->load()};
-        }
-
-        auto [connect_ec, endpoint] = co_await asio::async_connect(
-            *socket,
-            endpoints,
-            asio::as_tuple(asio::use_awaitable)
-        );
-        (void)endpoint;
-        if (connect_ec) {
-            timeout->cancel();
-            co_return UpstreamResult{connect_ec, {}, connect_ec.message(), timed_out->load()};
-        }
-
-        auto [write_ec, bytes] = co_await asio::async_write(
-            *socket,
-            asio::buffer(request),
-            asio::as_tuple(asio::use_awaitable)
-        );
-        (void)bytes;
-        if (write_ec) {
-            timeout->cancel();
-            co_return UpstreamResult{write_ec, {}, write_ec.message(), timed_out->load()};
-        }
-
-        auto result = co_await read_response(*socket, config_, byte_lease);
-        result.timed_out = timed_out->load();
-        if (result.timed_out && !result.error)
-            result.error = asio::error::timed_out;
-        timeout->cancel();
-        asio::error_code ignored;
-        socket->close(ignored);
-        co_return result;
-    }
-
-    asio::awaitable<UpstreamResult> send_upstream_tls(
-        string request,
-        shared_ptr<ByteLease> byte_lease
-    ) {
-        auto resolver = make_shared<tcp::resolver>(io_);
-        auto stream = make_shared<TlsStream>(io_, upstream_tls_context_);
-        auto timed_out = make_shared<atomic<bool>>(false);
-        auto timeout = make_shared<asio::steady_timer>(io_, config_.upstream_timeout);
-        timeout->async_wait([resolver, stream, timed_out](const asio::error_code& ec) {
-            if (ec)
-                return;
-            timed_out->store(true);
-            resolver->cancel();
-            asio::error_code ignored;
-            stream->next_layer().cancel(ignored);
-            stream->next_layer().close(ignored);
+        const auto executor = stream.get_executor();
+        tcp::resolver resolver(executor);
+        Deadline deadline(executor, expires_at, [&resolver, &socket] {
+            resolver.cancel();
+            close_socket(socket);
         });
 
         auto fail = [&](asio::error_code ec) {
-            timeout->cancel();
-            return UpstreamResult{ec, {}, ec.message(), timed_out->load()};
+            if (deadline.expired())
+                return UpstreamResult{asio::error::timed_out, {}, "upstream request timed out", true};
+            return UpstreamResult{ec, {}, ec.message(), false};
         };
+        if (deadline.expired())
+            co_return fail(asio::error::timed_out);
 
-        auto [resolve_ec, endpoints] = co_await resolver->async_resolve(
+        auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
             config_.upstream_host,
             config_.upstream_port,
             asio::as_tuple(asio::use_awaitable)
         );
-        if (resolve_ec)
+        if (resolve_ec || deadline.expired())
             co_return fail(resolve_ec);
 
         auto [connect_ec, endpoint] = co_await asio::async_connect(
-            stream->next_layer(),
+            socket,
             endpoints,
             asio::as_tuple(asio::use_awaitable)
         );
         (void)endpoint;
-        if (connect_ec)
+        if (connect_ec || deadline.expired())
             co_return fail(connect_ec);
 
-        if (!SSL_set_tlsext_host_name(stream->native_handle(), config_.upstream_host.c_str())) {
-            co_return fail(asio::error::operation_aborted);
-        }
-        if (!config_.upstream_insecure) {
-            stream->set_verify_callback(
-                asio::ssl::host_name_verification(config_.upstream_host)
+        if constexpr (is_same_v<Stream, TlsStream>) {
+            if (!SSL_set_tlsext_host_name(stream.native_handle(), config_.upstream_host.c_str()))
+                co_return fail(asio::error::operation_aborted);
+            if (!config_.upstream_insecure)
+                stream.set_verify_callback(asio::ssl::host_name_verification(config_.upstream_host));
+
+            auto [handshake_ec] = co_await stream.async_handshake(
+                asio::ssl::stream_base::client,
+                asio::as_tuple(asio::use_awaitable)
             );
+            if (handshake_ec || deadline.expired())
+                co_return fail(handshake_ec);
         }
 
-        auto [handshake_ec] = co_await stream->async_handshake(
-            asio::ssl::stream_base::client,
-            asio::as_tuple(asio::use_awaitable)
-        );
-        if (handshake_ec)
-            co_return fail(handshake_ec);
-
+        if (!running_.load())
+            co_return fail(asio::error::operation_aborted);
+        if (deadline.expired())
+            co_return fail(asio::error::timed_out);
         auto [write_ec, bytes] = co_await asio::async_write(
-            *stream,
+            stream,
             asio::buffer(request),
             asio::as_tuple(asio::use_awaitable)
         );
         (void)bytes;
-        if (write_ec)
+        if (write_ec || deadline.expired())
             co_return fail(write_ec);
 
-        auto result = co_await read_response(*stream, config_, byte_lease);
-        result.timed_out = timed_out->load();
-        if (result.timed_out && !result.error)
-            result.error = asio::error::timed_out;
-        timeout->cancel();
-        asio::error_code ignored;
-        stream->next_layer().close(ignored);
+        auto result = co_await read_response(stream, config_, job.byte_lease, job.request.http.method);
+        if (deadline.expired())
+            co_return fail(asio::error::timed_out);
         co_return result;
     }
 };

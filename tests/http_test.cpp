@@ -147,6 +147,25 @@ int main() {
         );
     }
 
+    {
+        const string response = "HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\n\r\n";
+        const auto inspected = inspect_http_response(response, limit, 64 * 1024, "HEAD");
+        expect(inspected.status == HttpResponseStatus::Complete, "HEAD Content-Length is metadata");
+        expect(inspected.message_size == response.size(), "HEAD ends after the headers");
+    }
+
+    {
+        const string response = "HTTP/1.1 304 Not Modified\r\nContent-Length: 42\r\n\r\n";
+        const auto inspected = inspect_http_response(response, limit);
+        expect(inspected.status == HttpResponseStatus::Complete, "304 Content-Length is metadata");
+    }
+
+    {
+        const string response = make_error_response(502, "Bad Gateway", "test error", false);
+        const auto inspected = inspect_http_response(response, limit, 64 * 1024, "HEAD");
+        expect(inspected.status == HttpResponseStatus::Complete, "proxy errors to HEAD have no body");
+    }
+
     if (failures != 0) {
         cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

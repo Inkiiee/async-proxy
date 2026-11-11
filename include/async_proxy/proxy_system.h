@@ -49,6 +49,7 @@ namespace async_proxy {
         std::chrono::milliseconds response_timeout{15000};
         std::chrono::milliseconds tls_shutdown_timeout{1000};
         std::chrono::milliseconds accept_retry_delay{100};
+        std::chrono::milliseconds response_write_timeout{10000};
     };
 
     struct ProxyRequest {

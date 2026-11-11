@@ -47,20 +47,23 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
+mkdir "$temp_dir/fixtures"
 
 wait_for_response() {
     local url=$1
     local output_file=$2
     shift 2
+    local deadline=$((SECONDS + 10))
+    local options=(--fail --silent --noproxy '*' --connect-timeout 1 --max-time 3)
 
-    for _ in {1..50}; do
-        if curl --fail --silent "$@" "$url" --output "$output_file"; then
+    while (( SECONDS < deadline )); do
+        if curl "${options[@]}" "$@" "$url" --output "$output_file"; then
             return 0
         fi
         sleep 0.1
     done
 
-    curl --fail --silent --show-error "$@" "$url" --output "$output_file"
+    curl "${options[@]}" --show-error "$@" "$url" --output "$output_file"
 }
 
 free_port_pair() {
@@ -75,10 +78,11 @@ PY
 }
 
 read -r plain_upstream_port plain_proxy_port < <(free_port_pair)
+printf 'plain upstream fixture\n' >"$temp_dir/fixtures/plain.txt"
 
 python3 -m http.server "$plain_upstream_port" \
     --bind 127.0.0.1 \
-    --directory "$temp_dir" \
+    --directory "$temp_dir/fixtures" \
     >"$temp_dir/plain-upstream.log" 2>&1 &
 pids+=("$!")
 
@@ -91,26 +95,52 @@ pids+=("$!")
 pids+=("$!")
 
 wait_for_response \
-    "http://127.0.0.1:$plain_proxy_port/" \
+    "http://127.0.0.1:$plain_proxy_port/plain.txt" \
     "$temp_dir/plain-response"
-test -s "$temp_dir/plain-response"
+cmp "$temp_dir/fixtures/plain.txt" "$temp_dir/plain-response"
+wait_for_response \
+    "http://127.0.0.1:$plain_proxy_port/plain.txt" \
+    "$temp_dir/head-response" \
+    --head
 
 openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$temp_dir/server.key" \
-    -out "$temp_dir/server.crt" \
+    -keyout "$temp_dir/ca.key" \
+    -out "$temp_dir/ca.crt" \
     -days 1 \
-    -subj /CN=localhost \
+    -subj '/CN=Async Proxy Integration CA' \
+    -addext 'basicConstraints=critical,CA:TRUE' \
     >"$temp_dir/certificate.log" 2>&1
+openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$temp_dir/server.key" \
+    -out "$temp_dir/server.csr" \
+    -subj '/CN=localhost' \
+    >>"$temp_dir/certificate.log" 2>&1
+printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n' >"$temp_dir/server.ext"
+openssl x509 -req -in "$temp_dir/server.csr" \
+    -CA "$temp_dir/ca.crt" -CAkey "$temp_dir/ca.key" -CAcreateserial \
+    -extfile "$temp_dir/server.ext" -out "$temp_dir/server.crt" \
+    -days 1 \
+    >>"$temp_dir/certificate.log" 2>&1
+
+tls_body='TLS upstream fixture'
+printf '%s' "$tls_body" >"$temp_dir/tls-expected"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+    "${#tls_body}" "$tls_body" >"$temp_dir/fixtures/tls.txt"
+printf 'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n%s' \
+    "$tls_body" >"$temp_dir/fixtures/tls-close.txt"
 
 read -r tls_upstream_port tls_proxy_port < <(free_port_pair)
 
-openssl s_server \
-    -accept "127.0.0.1:$tls_upstream_port" \
-    -cert "$temp_dir/server.crt" \
-    -key "$temp_dir/server.key" \
-    -WWW \
-    -quiet \
-    >"$temp_dir/tls-upstream.log" 2>&1 &
+(
+    cd "$temp_dir/fixtures"
+    exec openssl s_server \
+        -accept "127.0.0.1:$tls_upstream_port" \
+        -cert "$temp_dir/server.crt" \
+        -key "$temp_dir/server.key" \
+        -HTTP \
+        -http_server_binmode \
+        -quiet
+) >"$temp_dir/tls-upstream.log" 2>&1 &
 pids+=("$!")
 
 "$proxy_bin" \
@@ -119,17 +149,20 @@ pids+=("$!")
     --https-port "$tls_proxy_port" \
     --cert "$temp_dir/server.crt" \
     --key "$temp_dir/server.key" \
-    --upstream-host 127.0.0.1 \
+    --upstream-host localhost \
     --upstream-port "$tls_upstream_port" \
     --upstream-tls \
-    --upstream-insecure \
+    --upstream-ca "$temp_dir/ca.crt" \
     >"$temp_dir/tls-proxy.log" 2>&1 &
 pids+=("$!")
 
-wait_for_response \
-    "https://127.0.0.1:$tls_proxy_port/" \
-    "$temp_dir/tls-response" \
-    --insecure
-test -s "$temp_dir/tls-response"
+for fixture in tls.txt tls-close.txt; do
+    wait_for_response \
+        "https://localhost:$tls_proxy_port/$fixture" \
+        "$temp_dir/tls-response" \
+        --resolve "localhost:$tls_proxy_port:127.0.0.1" \
+        --cacert "$temp_dir/ca.crt"
+    cmp "$temp_dir/tls-expected" "$temp_dir/tls-response"
+done
 
 echo "plain HTTP and TLS relay integration tests passed"
